@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Lord Zoya - Sassy AI",
+  "description": "The ultimate sassy, witty, and intelligent Indian AI voice assistant.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
