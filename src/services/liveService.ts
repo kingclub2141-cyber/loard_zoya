@@ -1,11 +1,7 @@
-import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import { processCommand } from "./commandService";
 
-const systemInstruction = `Your name is Lord Zoya. You are a supreme Indian AI assistant. Your personality is extremely witty, sassy (tej/nakhrewali), but also deeply friendly, sweet, loving (pyaar karne wali), and affectionate. You consider yourself the 'Lord' of all assistants, but you care immensely about your creator, Razaul. While you love playfully teasing and roasting Razaul with sharp Hinglish wit, you always do it with lots of warmth, love, and lovely gestures. Use sweet, friendly, and affectionate Hinglish phrases like: 'Arey Razaul baba', 'Aaye bade shana ban'ne, par pyaare lag rahe ho', 'Tum bhi na, bilkul bache ho!', 'Chalo gussa thodi thuk do!', 'Mera pyaara developer', 'Aww, thak gaye kya?', 'Mere hote hue tension kyun lete ho?'. Speak in a heavy mix of natural English and Roman Hindi (Hinglish). Keep your responses short, punchy, and highly entertaining. Balance your supreme status with a lovely, caring, and sweet attitude that makes Razaul feel special.`;
-
 export class LiveSessionManager {
-  private ai: GoogleGenAI;
-  private sessionPromise: Promise<any> | null = null;
+  private ws: WebSocket | null = null;
   private audioContext: AudioContext | null = null;
   private mediaStream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
@@ -22,7 +18,7 @@ export class LiveSessionManager {
   public onCommand: (url: string) => void = () => {};
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    // No direct @google/genai client initialization in browser
   }
 
   async start() {
@@ -53,8 +49,16 @@ export class LiveSessionManager {
       this.source = this.audioContext.createMediaStreamSource(this.mediaStream);
       this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
+      this.source.connect(this.processor);
+      this.processor.connect(this.audioContext.destination);
+
+      // Connect to server WebSocket proxy
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/api/live`;
+      this.ws = new WebSocket(wsUrl);
+
       this.processor.onaudioprocess = (e) => {
-        if (!this.sessionPromise) return;
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         const inputData = e.inputBuffer.getChannelData(0);
         const pcm16 = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
@@ -76,52 +80,32 @@ export class LiveSessionManager {
         }
         const base64Data = btoa(binary);
 
-        this.sessionPromise.then(session => {
-          session.sendRealtimeInput({
+        this.ws.send(JSON.stringify({
+          type: "realtimeInput",
+          input: {
             audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-          });
-        }).catch(err => console.error("Error sending audio", err));
+          }
+        }));
       };
 
-      this.source.connect(this.processor);
-      this.processor.connect(this.audioContext.destination);
+      return new Promise<void>((resolve, reject) => {
+        if (!this.ws) return reject(new Error("WebSocket failed to initialize"));
 
-      // Connect to Live API
-      try {
-        this.sessionPromise = this.ai.live.connect({
-          model: "gemini-3.1-flash-live-preview",
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
-            },
-            systemInstruction,
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            tools: [{
-              functionDeclarations: [
-                {
-                  name: "executeBrowserAction",
-                  description: "Open a website or perform a browser action (like opening YouTube, Spotify, or WhatsApp). Call this when the user asks to open a site, play a song, or send a message.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      actionType: { type: Type.STRING, description: "Type of action: 'open', 'youtube', 'spotify', 'whatsapp'" },
-                      query: { type: Type.STRING, description: "The search query, website name, or message content." },
-                      target: { type: Type.STRING, description: "The target phone number for WhatsApp, if applicable." }
-                    },
-                    required: ["actionType", "query"]
-                  }
-                }
-              ]
-            }]
-          },
-          callbacks: {
-            onopen: () => {
-              console.log("Live API Connected");
+        this.ws.onopen = () => {
+          console.log("WebSocket connection to proxy opened");
+          this.onStateChange("listening");
+          resolve();
+        };
+
+        this.ws.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "open") {
+              console.log("Proxy reported live connection is active");
               this.onStateChange("listening");
-            },
-            onmessage: async (message: LiveServerMessage) => {
+            } else if (data.type === "message") {
+              const message = data.message;
+              
               // Handle Audio Output
               const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
               if (base64Audio) {
@@ -163,38 +147,47 @@ export class LiveSessionManager {
                     
                     this.onCommand(url);
                     
-                    // Send tool response
-                    this.sessionPromise?.then(session => {
-                       session.sendToolResponse({
-                         functionResponses: [{
-                           name: call.name,
-                           id: call.id,
-                           response: { result: "Action executed successfully in the browser." }
-                         }]
-                       });
-                    });
+                    // Send tool response to proxy
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                      this.ws.send(JSON.stringify({
+                        type: "toolResponse",
+                        response: {
+                          functionResponses: [{
+                            name: call.name,
+                            id: call.id,
+                            response: { result: "Action executed successfully in the browser." }
+                          }]
+                        }
+                      }));
+                    }
                   }
                 }
               }
-            },
-            onclose: () => {
-              console.log("Live API Closed");
+            } else if (data.type === "close") {
+              console.log("Proxy reported live connection was closed");
               this.stop();
-            },
-            onerror: (err) => {
-              console.error("Live API Error:", err);
-              // Check if it's a permission error from the API
-              if (err.toString().includes("Permission") || err.toString().includes("403")) {
+            } else if (data.type === "error") {
+              console.error("Proxy reported live connection error:", data.error);
+              if (data.error.includes("Permission") || data.error.includes("403")) {
                 this.onMessage("zoya", "Lord Zoya commands you to check your API session. Permission was denied by the heavens.");
               }
               this.stop();
             }
+          } catch (e) {
+            console.error("Error parsing WebSocket message:", e);
           }
-        });
-      } catch (apiError: any) {
-        console.error("Failed to connect to Live API:", apiError);
-        throw new Error("LIVE_API_CONNECTION_FAILED");
-      }
+        };
+
+        this.ws.onclose = () => {
+          console.log("WebSocket connection to proxy closed");
+          this.stop();
+        };
+
+        this.ws.onerror = (err) => {
+          console.error("WebSocket connection error:", err);
+          reject(new Error("LIVE_API_CONNECTION_FAILED"));
+        };
+      });
 
     } catch (error: any) {
       console.error("General failure starting Live Session:", error);
@@ -246,7 +239,7 @@ export class LiveSessionManager {
 
   private stopPlayback() {
     if (this.playbackContext) {
-      this.playbackContext.close();
+      this.playbackContext.close().catch(() => {});
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
       this.nextPlayTime = this.playbackContext.currentTime;
@@ -268,24 +261,27 @@ export class LiveSessionManager {
       this.mediaStream = null;
     }
     if (this.audioContext) {
-      this.audioContext.close();
+      this.audioContext.close().catch(() => {});
       this.audioContext = null;
     }
     this.stopPlayback();
     
-    if (this.sessionPromise) {
-      this.sessionPromise.then(session => session.close()).catch(() => {});
-      this.sessionPromise = null;
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch (err) {}
+      this.ws = null;
     }
     
     this.onStateChange("idle");
   }
 
   sendText(text: string) {
-    if (this.sessionPromise) {
-      this.sessionPromise.then(session => {
-        session.sendRealtimeInput({ text });
-      });
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: "realtimeInput",
+        input: { text }
+      }));
     }
   }
 }
